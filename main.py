@@ -140,10 +140,10 @@ async def handle_admin_reply(message: types.Message):
         # Нет привязки – значит это ответ не на "служебное" сообщение бота
         return
 
-    admin_name = message.from_user.full_name
+    admin_name = "Аббас Галлямов"
 
-    # Формируем текст / медиасообщение для пользователя
-    header = f"{admin_name} ответил(а) на ваше сообщение:"
+    header = f"{admin_name} ответил на ваше сообщение:"
+
 
     # Ответ текстом
     if message.text:
