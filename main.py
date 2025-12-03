@@ -128,13 +128,13 @@ def make_unban_keyboard(user_id: int) -> InlineKeyboardMarkup:
 
 def build_status_text(lang: str, anon: bool) -> str:
     if lang == "en":
-        lang_line = "Language: English"
-        anon_line = "Anonymous mode: enabled" if anon else "Anonymous mode: disabled"
-        return f"⚙️ Bot status\n\n{lang_line}\n{anon_line}"
+        anon_part = "Anon: ON" if anon else "Anon: OFF"
+        lang_part = "Lang: English"
+        return f"{anon_part} | {lang_part}"
     else:
-        lang_line = "Язык: Русский"
-        anon_line = "Анонимный режим: включен" if anon else "Анонимный режим: выключен"
-        return f"⚙️ Статус бота\n\n{lang_line}\n{anon_line}"
+        anon_part = "Анон: Вкл" if anon else "Анон: Выкл"
+        lang_part = "Язык: Русский"
+        return f"{anon_part} | {lang_part}"
 
 
 async def ensure_status_message(user_id: int) -> None:
@@ -143,27 +143,23 @@ async def ensure_status_message(user_id: int) -> None:
     anon = settings["anon"]
     status_msg_id = settings.get("status_msg_id")
 
+    text = build_status_text(lang, anon)
+
     if status_msg_id:
-        # просто обновим текст
         try:
             await bot.edit_message_text(
                 chat_id=user_id,
                 message_id=status_msg_id,
-                text=build_status_text(lang, anon),
+                text=text,
             )
             return
         except Exception:
-            # если по какой-то причине не получилось – попробуем создать новый
             pass
 
-    msg = await bot.send_message(
-        chat_id=user_id,
-        text=build_status_text(lang, anon),
-    )
+    msg = await bot.send_message(chat_id=user_id, text=text)
     try:
         await bot.pin_chat_message(chat_id=user_id, message_id=msg.message_id)
     except Exception:
-        # если не дали закрепить – хотя бы сохраним ID
         pass
     settings["status_msg_id"] = msg.message_id
 
@@ -177,11 +173,11 @@ def build_start_text(lang: str) -> str:
             "• ask a question\n"
             "• share your opinion\n"
             "• send an idea or suggestion\n\n"
-            "You can send a message as text, a photo or a video. "
+            "You can send a message as text, photo or video. "
             "Admins will read it and, if necessary, reply to you.\n\n"
-            "You can enable anonymous mode so that admins do not see your name. "
-            "Use the button below, or the /anon command.\n"
-            "After changing anonymity or language, simply send your message."
+            "You can enable anonymous mode so that admins do not see your data. "
+            "Use the button below or the /anon command.\n"
+            "After changing anonymity or language, just send your message."
         )
     else:
         return (
@@ -192,7 +188,7 @@ def build_start_text(lang: str) -> str:
             "• поделиться мнением\n"
             "• отправить идею или предложение\n\n"
             "Вы можете отправлять текст, фотографии и видео. "
-            "Админы все прочитают и при необходимости ответят вам.\n\n"
+            "Админы всё прочитают и при необходимости ответят вам.\n\n"
             "Вы можете включить анонимный режим, чтобы админы не видели ваши данные. "
             "Используйте кнопку ниже или команду /anon.\n"
             "После изменения анонимности или языка просто отправьте сообщение."
@@ -224,14 +220,14 @@ def build_anon_on_text(lang: str) -> str:
     if lang == "en":
         return "Anonymous mode is now ON. Your next messages will be sent anonymously."
     else:
-        return "Анонимный режим включен. Ваши следующие сообщения будут приходить админам как анонимные."
+        return "Анонимный режим включен. Ваши следующие сообщения будут приходить как анонимные."
 
 
 def build_anon_off_text(lang: str) -> str:
     if lang == "en":
-        return "Anonymous mode is now OFF. Your future messages will be sent with your name."
+        return "Anonymous mode is now OFF. Your future messages will be sent with your data."
     else:
-        return "Анонимный режим отключен. Ваши будущие сообщения будут приходить админам с вашими данными."
+        return "Анонимный режим отключен. Ваши будущие сообщения будут приходить с вашими данными."
 
 
 def build_answer_header(lang: str) -> str:
@@ -241,8 +237,7 @@ def build_answer_header(lang: str) -> str:
         return "Аббас Галлямов ответил на ваше сообщение:"
 
 
-def build_stats_period_label(period: str, lang: str) -> str:
-    # статистика только для админов, оставлю на русском, чтобы не усложнять
+def build_stats_period_label(period: str) -> str:
     if period == "day":
         return "за последние 24 часа"
     elif period == "week":
@@ -315,10 +310,8 @@ async def cb_toggle_anon(callback: types.CallbackQuery):
     settings["anon"] = not settings.get("anon", False)
     lang = settings["lang"]
 
-    # обновляем закрепленный статус
     await ensure_status_message(user_id)
 
-    # обновляем клавиатуру под стартовым сообщением (если оно еще существует)
     try:
         await callback.message.edit_reply_markup(
             reply_markup=make_start_keyboard(lang, settings["anon"])
@@ -326,7 +319,6 @@ async def cb_toggle_anon(callback: types.CallbackQuery):
     except Exception:
         pass
 
-    # без лишнего текста в чате - только маленькое уведомление
     await callback.answer(
         build_anon_on_text(lang) if settings["anon"] else build_anon_off_text(lang),
         show_alert=False,
@@ -346,18 +338,22 @@ async def cb_set_lang(callback: types.CallbackQuery):
     settings["lang"] = lang_code
     lang = settings["lang"]
 
-    # обновляем закрепленный статус
     await ensure_status_message(user_id)
 
-    # обновляем клавиатуру под стартовым
+    # меняем и текст приветствия, и клавиатуру
     try:
-        await callback.message.edit_reply_markup(
-            reply_markup=make_start_keyboard(lang, settings["anon"])
+        await callback.message.edit_text(
+            build_start_text(lang),
+            reply_markup=make_start_keyboard(lang, settings["anon"]),
         )
     except Exception:
-        pass
+        try:
+            await callback.message.edit_reply_markup(
+                reply_markup=make_start_keyboard(lang, settings["anon"])
+            )
+        except Exception:
+            pass
 
-    # небольшое уведомление
     if lang == "en":
         await callback.answer("Language switched to English", show_alert=False)
     else:
@@ -376,7 +372,6 @@ async def cmd_anon(message: types.Message):
     parts = message.text.split(maxsplit=1)
 
     if len(parts) == 1:
-        # просто переключатель
         settings["anon"] = not settings["anon"]
         await ensure_status_message(user_id)
         if settings["anon"]:
@@ -422,8 +417,12 @@ async def handle_user_message(message: types.Message):
     lang = settings["lang"]
     anon = settings["anon"]
 
-    # игнорируем команды (кроме /start и /anon - они уже обработаны выше)
+    # игнорируем команды (кроме /start и /anon - уже обработаны)
     if message.text and message.text.startswith("/"):
+        return
+
+    # игнорируем закрепленные сообщения и прочий сервис, который не является реальным вводом
+    if message.content_type == "pinned_message":
         return
 
     # проверка на бан
@@ -445,19 +444,18 @@ async def handle_user_message(message: types.Message):
     media_group_id = message.media_group_id
     is_album_first = False
     if media_group_id:
-        # альбом (несколько фото/видео)
         if media_group_id in handled_media_groups:
             is_album_first = False
         else:
             is_album_first = True
             handled_media_groups.add(media_group_id)
 
-    # Если тип не поддерживается - просто говорим об этом, без "спасибо"
+    # Если тип не поддерживается – просто скажем об этом, без "спасибо"
     if kind == "unsupported":
         await message.answer(build_unsupported_text(lang))
         return
 
-    # Логируем сообщение для статистики (только один раз на альбом)
+    # Логируем сообщение для статистики (один раз на альбом)
     if (not media_group_id) or is_album_first:
         user_message_log.append(
             {
@@ -468,47 +466,63 @@ async def handle_user_message(message: types.Message):
             }
         )
 
-    # отправляем "спасибо" только если сообщение реально будет отправлено
-    # (и только один раз на альбом)
+    # "Спасибо" только если сообщение будет реально отправлено (и раз на альбом)
     if (not media_group_id) or is_album_first:
         await message.answer(build_thanks_text(lang))
 
-    # --- Отправка в админ-группу ---
-
     sent_msg: types.Message | None = None
 
-    # Текст (с анти-дубляжом)
+    # --- Текст (с анти-дубляжом, включая медиа, если последнее было медиа) ---
     if kind == "text":
         base_text: str
-        if anon:
-            base_text = (
-                "📩 <b>Новое анонимное сообщение</b>\n\n"
-                f"💬 <b>Текст:</b>\n{message.text}"
-            )
-        else:
-            user_block = format_user_info(user)
-            base_text = (
-                "📩 <b>Новое сообщение от пользователя</b>\n\n"
-                f"{user_block}\n\n"
-                f"💬 <b>Текст:</b>\n{message.text}"
-            )
-
         now = time.time()
         info = last_admin_message.get(user_id)
 
-        # если последнее сообщение было недавно и тоже текстовое - редактируем его
-        if info and now - info["time"] <= 60 and not info.get("has_media", False):
-            new_text = info["text"] + "\n\n➕ <b>Дополнение:</b>\n" + message.text
-            await bot.edit_message_text(
-                chat_id=info["chat_id"],
-                message_id=info["message_id"],
-                text=new_text,
-            )
+        if anon:
+            text_block = message.text
+            # если есть последнее сообщение и оно свежее - дополняем его
+        else:
+            text_block = message.text
+
+        if info and now - info["time"] <= 60:
+            # есть последнее сообщение (может быть текст или медиа), добавим "Дополнение"
+            old_text = info["text"]
+            new_block = old_text + "\n\n➕ <b>Дополнение:</b>\n" + message.text
+
+            if info.get("has_media", False):
+                # редактируем подпись медиа
+                await bot.edit_message_caption(
+                    chat_id=info["chat_id"],
+                    message_id=info["message_id"],
+                    caption=new_block,
+                )
+            else:
+                # редактируем текст
+                await bot.edit_message_text(
+                    chat_id=info["chat_id"],
+                    message_id=info["message_id"],
+                    text=new_block,
+                )
+
             info["time"] = now
-            info["text"] = new_text
+            info["text"] = new_block
             last_admin_message[user_id] = info
             sent_msg = None
         else:
+            # создаем новое текстовое сообщение
+            if anon:
+                base_text = (
+                    "📩 <b>Новое анонимное сообщение</b>\n\n"
+                    f"💬 <b>Текст:</b>\n{message.text}"
+                )
+            else:
+                user_block = format_user_info(user)
+                base_text = (
+                    "📩 <b>Новое сообщение от пользователя</b>\n\n"
+                    f"{user_block}\n\n"
+                    f"💬 <b>Текст:</b>\n{message.text}"
+                )
+
             sent_msg = await bot.send_message(
                 chat_id=ADMIN_CHAT_ID,
                 text=base_text,
@@ -523,7 +537,7 @@ async def handle_user_message(message: types.Message):
                 "is_anon": anon,
             }
 
-    # Фото
+    # --- Фото ---
     elif kind == "photo":
         caption = message.caption or ""
         if anon:
@@ -539,7 +553,7 @@ async def handle_user_message(message: types.Message):
                 f"💬 <b>Подпись:</b>\n{caption}"
             )
 
-        # если это продолжение альбома - просто досылаем фото без кнопок и заголовка
+        # если это часть альбома, но не первая – просто досылаем фото
         if media_group_id and not is_album_first:
             await bot.send_photo(
                 chat_id=ADMIN_CHAT_ID,
@@ -564,7 +578,7 @@ async def handle_user_message(message: types.Message):
             "is_anon": anon,
         }
 
-    # Видео
+    # --- Видео ---
     elif kind == "video":
         caption = message.caption or ""
         if anon:
@@ -605,7 +619,6 @@ async def handle_user_message(message: types.Message):
         }
 
     else:
-        # сюда уже не должны попасть, но на всякий
         await message.answer(build_unsupported_text(lang))
         return
 
@@ -627,7 +640,6 @@ async def handle_admin_reply(message: types.Message):
     settings = get_user_settings(user_id)
     lang = settings["lang"]
 
-    # фиксированное имя отправителя для пользователя
     header = build_answer_header(lang)
 
     if user_id in banned_users:
@@ -659,7 +671,6 @@ async def handle_admin_reply(message: types.Message):
             text=f"{header}\n\n(отправлен ответ, который я пока не умею переслать в исходном виде)",
         )
 
-    # чтобы не засорять чат – оставляем только галочку
     await message.reply("✅ Ответ отправлен пользователю.")
 
 
@@ -708,7 +719,6 @@ async def handle_ban_confirm(callback: types.CallbackQuery):
 
     banned_users.add(target_user_id)
 
-    # сохраняем информацию о бане
     ts = time.time()
     name = None
     username = None
@@ -725,7 +735,6 @@ async def handle_ban_confirm(callback: types.CallbackQuery):
         "username": username,
     }
 
-    # после бана - показываем кнопку "Разблокировать пользователя"
     await callback.message.edit_reply_markup(
         reply_markup=make_unban_keyboard(target_user_id)
     )
@@ -852,9 +861,8 @@ async def cmd_bans(message: types.Message):
 # --- Статистика: выбор периода и расчет ---
 
 
-@dp.message(F.chat.id == ADMIN_CHAT_ID, F.text == "/stats")
-async def cmd_stats(message: types.Message):
-    kb = InlineKeyboardMarkup(
+def make_stats_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
@@ -878,6 +886,24 @@ async def cmd_stats(message: types.Message):
             ],
         ]
     )
+
+
+def make_stats_back_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔙 Назад",
+                    callback_data="stats:back",
+                )
+            ]
+        ]
+    )
+
+
+@dp.message(F.chat.id == ADMIN_CHAT_ID, F.text == "/stats")
+async def cmd_stats(message: types.Message):
+    kb = make_stats_menu_keyboard()
     await message.reply("Выберите период для статистики:", reply_markup=kb)
 
 
@@ -893,7 +919,7 @@ def build_stats_text(period: str) -> str:
     else:
         cutoff = 0
 
-    label = build_stats_period_label(period, "ru")
+    label = build_stats_period_label(period)
 
     filtered = [e for e in user_message_log if e["timestamp"] >= cutoff]
 
@@ -929,8 +955,20 @@ async def handle_stats_callback(callback: types.CallbackQuery):
         await callback.answer("Ошибка при выборе периода.", show_alert=True)
         return
 
+    if period == "back":
+        # возвращаем меню выбора периода
+        await callback.message.edit_text(
+            "Выберите период для статистики:",
+            reply_markup=make_stats_menu_keyboard(),
+        )
+        await callback.answer()
+        return
+
     stats_text = build_stats_text(period)
-    await callback.message.reply(stats_text)
+    await callback.message.edit_text(
+        stats_text,
+        reply_markup=make_stats_back_keyboard(),
+    )
     await callback.answer()
 
 
