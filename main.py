@@ -1,7 +1,7 @@
 import os
 import time
 import logging
-from typing import Dict, Tuple, Set, Any
+from typing import Dict, Tuple, Set, Any, List
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -55,14 +55,12 @@ anon_users: Set[int] = set()
 # заблокированные пользователи
 banned_users: Set[int] = set()
 
-# статистика
-stats_total_messages: int = 0
-stats_text_messages: int = 0
-stats_photo_messages: int = 0
-stats_unique_users: Set[int] = set()
+# лог всех пользовательских сообщений для статистики
+# каждый элемент: {"user_id": int, "timestamp": float, "type": "text"|"photo", "is_anon": bool}
+user_message_log: List[Dict[str, Any]] = []
 
 # анти-дубляж: последний отправленный в группу месседж для каждого пользователя
-# user_id -> {"chat_id": int, "message_id": int, "text": str, "time": float, "is_anon": bool}
+# user_id -> {"chat_id": int, "message_id": int, "text": str, "time": float, "has_photo": bool, "is_anon": bool}
 last_admin_message: Dict[int, Dict[str, Any]] = {}
 
 
@@ -87,6 +85,19 @@ def make_ban_keyboard(user_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def make_unban_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔓 Разблокировать пользователя",
+                    callback_data=f"unban:{user_id}",
+                )
+            ]
+        ]
+    )
+
+
 # --- Команда /start в личке ---
 
 
@@ -100,8 +111,8 @@ async def cmd_start(message: types.Message):
         "• поделиться мнением\n"
         "• отправить идею или предложение\n\n"
         "Просто напишите сообщение одним или несколькими абзацами, "
-        "или отправьте фото с подписью – админы всё прочитают и при необходимости ответят вам.\n\n"
-        "Если хотите скрыть свои данные от админов, отправьте команду /anon – тогда ваши сообщения "
+        "или отправьте фото с подписью - админы все прочитают и при необходимости ответят вам.\n\n"
+        "Если хотите скрыть свои данные от админов, отправьте команду /anon - тогда ваши сообщения "
         "будут приходить как анонимные. При этом бот все равно сможет вам отвечать."
     )
     await message.answer(text)
@@ -154,12 +165,10 @@ async def cmd_anon(message: types.Message):
 
 @dp.message(F.chat.type == "private")
 async def handle_user_message(message: types.Message):
-    global stats_total_messages, stats_text_messages, stats_photo_messages
-
     user = message.from_user
     user_id = user.id
 
-    # игнорируем все команды (кроме /start и /anon - они уже обработаны выше)
+    # игнорируем все команды (кроме /start и /anon - они обработаны выше)
     if message.text and message.text.startswith("/"):
         return
 
@@ -170,15 +179,26 @@ async def handle_user_message(message: types.Message):
         )
         return
 
-    # статистика
-    stats_total_messages += 1
-    stats_unique_users.add(user_id)
-    if message.text:
-        stats_text_messages += 1
-    elif message.photo:
-        stats_photo_messages += 1
-
     is_anon = user_id in anon_users
+
+    # логируем сообщение для статистики
+    msg_type: str
+    if message.text:
+        msg_type = "text"
+    elif message.photo:
+        msg_type = "photo"
+    else:
+        msg_type = "other"
+
+    if msg_type in ("text", "photo"):
+        user_message_log.append(
+            {
+                "user_id": user_id,
+                "timestamp": time.time(),
+                "type": msg_type,
+                "is_anon": is_anon,
+            }
+        )
 
     # подтверждение пользователю
     await message.answer("Спасибо, ваше сообщение отправлено админам ✅")
@@ -207,18 +227,15 @@ async def handle_user_message(message: types.Message):
 
         # если последнее сообщение этого пользователя было меньше 60 секунд назад и тоже текстовое - редактируем его
         if info and now - info["time"] <= 60 and not info.get("has_photo", False):
-            # дополняем существующий текст
             new_text = info["text"] + "\n\n➕ <b>Дополнение:</b>\n" + message.text
             await bot.edit_message_text(
                 chat_id=info["chat_id"],
                 message_id=info["message_id"],
                 text=new_text,
             )
-            # обновляем время и текст
             info["time"] = now
             info["text"] = new_text
             last_admin_message[user_id] = info
-            # бан-кнопка уже есть в этом сообщении, заново не добавляем
             sent_msg = None
         else:
             # отправляем новое сообщение в админ-группу
@@ -259,7 +276,6 @@ async def handle_user_message(message: types.Message):
             reply_markup=make_ban_keyboard(user_id),
         )
 
-        # фото не мержим в одно сообщение с текстом
         last_admin_message[user_id] = {
             "chat_id": ADMIN_CHAT_ID,
             "message_id": sent_msg.message_id,
@@ -276,7 +292,6 @@ async def handle_user_message(message: types.Message):
         )
         return
 
-    # привязка для ответов (если есть свежее сообщение от бота в группе)
     if sent_msg:
         message_targets[(ADMIN_CHAT_ID, sent_msg.message_id)] = user_id
 
@@ -290,26 +305,21 @@ async def handle_admin_reply(message: types.Message):
     user_id = message_targets.get(key)
 
     if not user_id:
-        # нет привязки – значит это ответ не на "служебное" сообщение бота
         return
 
     # фиксированное имя отправителя для пользователя
     admin_name = "Аббас Галлямов"
     header = f"{admin_name} ответил на ваше сообщение:"
 
-    # если пользователь уже в бане – не отвечаем
     if user_id in banned_users:
         await message.reply("Пользователь уже заблокирован, ответ не отправлен.")
         return
 
-    # Ответ текстом
     if message.text:
         await bot.send_message(
             chat_id=user_id,
             text=f"{header}\n\n{message.text}",
         )
-
-    # Ответ фотографией
     elif message.photo:
         caption = message.caption or ""
         await bot.send_photo(
@@ -317,7 +327,6 @@ async def handle_admin_reply(message: types.Message):
             photo=message.photo[-1].file_id,
             caption=f"{header}\n\n{caption}",
         )
-
     else:
         await bot.send_message(
             chat_id=user_id,
@@ -327,7 +336,7 @@ async def handle_admin_reply(message: types.Message):
     await message.reply("✅ Ответ отправлен пользователю.")
 
 
-# --- Кнопки бана (ban, confirm, cancel) ---
+# --- Кнопки бана и разбана ---
 
 
 @dp.callback_query(F.message.chat.id == ADMIN_CHAT_ID, F.data.startswith("ban:"))
@@ -340,7 +349,6 @@ async def handle_ban_button(callback: types.CallbackQuery):
         await callback.answer("Ошибка: не могу прочитать ID пользователя.", show_alert=True)
         return
 
-    # показываем клавиатуру подтверждения
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -373,9 +381,9 @@ async def handle_ban_confirm(callback: types.CallbackQuery):
 
     banned_users.add(target_user_id)
 
-    # убираем клавиатуру или меняем её обратно на одну кнопку
+    # после бана - показываем кнопку "Разблокировать пользователя"
     await callback.message.edit_reply_markup(
-        reply_markup=None
+        reply_markup=make_unban_keyboard(target_user_id)
     )
     await callback.message.reply("🚫 Пользователь заблокирован.")
     await callback.answer("Пользователь добавлен в черный список.", show_alert=False)
@@ -391,28 +399,161 @@ async def handle_ban_cancel(callback: types.CallbackQuery):
         await callback.answer("Отмена.", show_alert=False)
         return
 
-    # возвращаем обычную кнопку "Заблокировать пользователя"
     await callback.message.edit_reply_markup(
         reply_markup=make_ban_keyboard(target_user_id)
     )
     await callback.answer("Блокировка отменена.", show_alert=False)
 
 
-# --- Статистика для админов ---
+@dp.callback_query(F.message.chat.id == ADMIN_CHAT_ID, F.data.startswith("unban:"))
+async def handle_unban_button(callback: types.CallbackQuery):
+    data = callback.data or ""
+    try:
+        _, user_id_str = data.split(":", 1)
+        target_user_id = int(user_id_str)
+    except Exception:
+        await callback.answer("Ошибка: не могу прочитать ID пользователя.", show_alert=True)
+        return
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Подтвердить разблокировку",
+                    callback_data=f"unbanconfirm:{target_user_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="❌ Отмена",
+                    callback_data=f"unbancancel:{target_user_id}",
+                )
+            ],
+        ]
+    )
+    await callback.message.edit_reply_markup(reply_markup=kb)
+    await callback.answer("Подтвердить разблокировку пользователя?", show_alert=False)
+
+
+@dp.callback_query(F.message.chat.id == ADMIN_CHAT_ID, F.data.startswith("unbanconfirm:"))
+async def handle_unban_confirm(callback: types.CallbackQuery):
+    data = callback.data or ""
+    try:
+        _, user_id_str = data.split(":", 1)
+        target_user_id = int(user_id_str)
+    except Exception:
+        await callback.answer("Ошибка: не могу прочитать ID пользователя.", show_alert=True)
+        return
+
+    banned_users.discard(target_user_id)
+
+    # возвращаем кнопку "Заблокировать пользователя"
+    await callback.message.edit_reply_markup(
+        reply_markup=make_ban_keyboard(target_user_id)
+    )
+    await callback.message.reply("🔓 Пользователь разблокирован.")
+    await callback.answer("Пользователь удален из черного списка.", show_alert=False)
+
+
+@dp.callback_query(F.message.chat.id == ADMIN_CHAT_ID, F.data.startswith("unbancancel:"))
+async def handle_unban_cancel(callback: types.CallbackQuery):
+    data = callback.data or ""
+    try:
+        _, user_id_str = data.split(":", 1)
+        target_user_id = int(user_id_str)
+    except Exception:
+        await callback.answer("Отмена.", show_alert=False)
+        return
+
+    await callback.message.edit_reply_markup(
+        reply_markup=make_unban_keyboard(target_user_id)
+    )
+    await callback.answer("Разблокировка отменена.", show_alert=False)
+
+
+# --- Статистика: выбор периода и расчет ---
 
 
 @dp.message(F.chat.id == ADMIN_CHAT_ID, F.text == "/stats")
 async def cmd_stats(message: types.Message):
-    text = (
-        "📊 <b>Статистика бота</b>\n\n"
-        f"Всего сообщений от пользователей: <b>{stats_total_messages}</b>\n"
-        f"Уникальных пользователей: <b>{len(stats_unique_users)}</b>\n"
-        f"Текстовых сообщений: <b>{stats_text_messages}</b>\n"
-        f"Сообщений с фото: <b>{stats_photo_messages}</b>\n"
-        f"Анонимных пользователей (сейчас): <b>{len(anon_users)}</b>\n"
-        f"Заблокированных пользователей: <b>{len(banned_users)}</b>"
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📅 За сутки",
+                    callback_data="stats:day",
+                ),
+                InlineKeyboardButton(
+                    text="📅 За неделю",
+                    callback_data="stats:week",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📅 За месяц",
+                    callback_data="stats:month",
+                ),
+                InlineKeyboardButton(
+                    text="📅 За все время",
+                    callback_data="stats:all",
+                ),
+            ],
+        ]
     )
-    await message.reply(text)
+    await message.reply("Выберите период для статистики:", reply_markup=kb)
+
+
+def build_stats_text(period: str) -> str:
+    now = time.time()
+
+    if period == "day":
+        cutoff = now - 24 * 60 * 60
+        label = "за последние 24 часа"
+    elif period == "week":
+        cutoff = now - 7 * 24 * 60 * 60
+        label = "за последнюю неделю"
+    elif period == "month":
+        cutoff = now - 30 * 24 * 60 * 60
+        label = "за последний месяц"
+    else:
+        cutoff = 0
+        label = "за все время"
+
+    filtered = [e for e in user_message_log if e["timestamp"] >= cutoff]
+
+    if not filtered:
+        return f"📊 За период {label} сообщений от пользователей не было."
+
+    total = len(filtered)
+    users = {e["user_id"] for e in filtered}
+    text_count = sum(1 for e in filtered if e["type"] == "text")
+    photo_count = sum(1 for e in filtered if e["type"] == "photo")
+    anon_users_in_period = {e["user_id"] for e in filtered if e["is_anon"]}
+
+    text = (
+        f"📊 <b>Статистика {label}</b>\n\n"
+        f"Всего сообщений: <b>{total}</b>\n"
+        f"Уникальных пользователей: <b>{len(users)}</b>\n"
+        f"Текстовых сообщений: <b>{text_count}</b>\n"
+        f"Сообщений с фото: <b>{photo_count}</b>\n"
+        f"Пользователей, писавших анонимно в этот период: <b>{len(anon_users_in_period)}</b>\n"
+        f"Заблокированных пользователей сейчас: <b>{len(banned_users)}</b>"
+    )
+    return text
+
+
+@dp.callback_query(F.message.chat.id == ADMIN_CHAT_ID, F.data.startswith("stats:"))
+async def handle_stats_callback(callback: types.CallbackQuery):
+    data = callback.data or ""
+    try:
+        _, period = data.split(":", 1)
+    except Exception:
+        await callback.answer("Ошибка при выборе периода.", show_alert=True)
+        return
+
+    stats_text = build_stats_text(period)
+    await callback.message.reply(stats_text)
+    await callback.answer()
 
 
 # --- Webhook FastAPI часть ---
@@ -427,7 +568,6 @@ async def telegram_webhook(request: Request):
 
     update = types.Update.model_validate(data)
 
-    # простая защита от повторной обработки одного и того же апдейта
     if update.update_id in processed_updates:
         return {"ok": True}
     processed_updates.add(update.update_id)
