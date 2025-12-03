@@ -484,30 +484,49 @@ async def handle_user_message(message: types.Message):
         else:
             text_block = message.text
 
+
+
+
+
+
         if info and now - info["time"] <= 60:
             # есть последнее сообщение (может быть текст или медиа), добавим "Дополнение"
             old_text = info["text"]
             new_block = old_text + "\n\n➕ <b>Дополнение:</b>\n" + message.text
 
+            # выбираем, какая клавиатура должна быть сейчас
+            if user_id in banned_users:
+                kb = make_unban_keyboard(user_id)
+            else:
+                kb = make_ban_keyboard(user_id)
+
             if info.get("has_media", False):
-                # редактируем подпись медиа
+                # редактируем подпись медиа и сохраняем клавиатуру
                 await bot.edit_message_caption(
                     chat_id=info["chat_id"],
                     message_id=info["message_id"],
                     caption=new_block,
+                    reply_markup=kb,
                 )
             else:
-                # редактируем текст
+                # редактируем текст и сохраняем клавиатуру
                 await bot.edit_message_text(
                     chat_id=info["chat_id"],
                     message_id=info["message_id"],
                     text=new_block,
+                    reply_markup=kb,
                 )
 
             info["time"] = now
             info["text"] = new_block
             last_admin_message[user_id] = info
             sent_msg = None
+
+
+
+
+
+
         else:
             # создаем новое текстовое сообщение
             if anon:
