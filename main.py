@@ -55,6 +55,9 @@ anon_users: Set[int] = set()
 # заблокированные пользователи
 banned_users: Set[int] = set()
 
+# журнал банов: user_id -> {"timestamp": float, "name": str|None, "username": str|None}
+ban_log: Dict[int, Dict[str, Any]] = {}
+
 # лог всех пользовательских сообщений для статистики
 # каждый элемент: {"user_id": int, "timestamp": float, "type": "text"|"photo", "is_anon": bool}
 user_message_log: List[Dict[str, Any]] = []
@@ -369,8 +372,8 @@ async def handle_ban_button(callback: types.CallbackQuery):
     await callback.answer("Вы уверены, что хотите заблокировать пользователя?", show_alert=False)
 
 
-@dp.callback_query(F.message.chat.id == ADMIN_CHAT_ID, F.data.startswith("banconfirm:"))
-async def handle_ban_confirm(callback: types.CallbackQuery):
+@dp.callback_query(F.message.chat.id == ADMIN_CHAT_ID, F.data.startswith("unbanconfirm:"))
+async def handle_unban_confirm(callback: types.CallbackQuery):
     data = callback.data or ""
     try:
         _, user_id_str = data.split(":", 1)
@@ -379,14 +382,16 @@ async def handle_ban_confirm(callback: types.CallbackQuery):
         await callback.answer("Ошибка: не могу прочитать ID пользователя.", show_alert=True)
         return
 
-    banned_users.add(target_user_id)
+    banned_users.discard(target_user_id)
+    ban_log.pop(target_user_id, None)
 
-    # после бана - показываем кнопку "Разблокировать пользователя"
+    # возвращаем кнопку "Заблокировать пользователя"
     await callback.message.edit_reply_markup(
-        reply_markup=make_unban_keyboard(target_user_id)
+        reply_markup=make_ban_keyboard(target_user_id)
     )
-    await callback.message.reply("🚫 Пользователь заблокирован.")
-    await callback.answer("Пользователь добавлен в черный список.", show_alert=False)
+    await callback.message.reply("🔓 Пользователь разблокирован.")
+    await callback.answer("Пользователь удален из черного списка.", show_alert=False)
+
 
 
 @dp.callback_query(F.message.chat.id == ADMIN_CHAT_ID, F.data.startswith("bancancel:"))
@@ -435,8 +440,8 @@ async def handle_unban_button(callback: types.CallbackQuery):
     await callback.answer("Подтвердить разблокировку пользователя?", show_alert=False)
 
 
-@dp.callback_query(F.message.chat.id == ADMIN_CHAT_ID, F.data.startswith("unbanconfirm:"))
-async def handle_unban_confirm(callback: types.CallbackQuery):
+@dp.callback_query(F.message.chat.id == ADMIN_CHAT_ID, F.data.startswith("banconfirm:"))
+async def handle_ban_confirm(callback: types.CallbackQuery):
     data = callback.data or ""
     try:
         _, user_id_str = data.split(":", 1)
@@ -445,14 +450,33 @@ async def handle_unban_confirm(callback: types.CallbackQuery):
         await callback.answer("Ошибка: не могу прочитать ID пользователя.", show_alert=True)
         return
 
-    banned_users.discard(target_user_id)
+    banned_users.add(target_user_id)
 
-    # возвращаем кнопку "Заблокировать пользователя"
+    # сохраняем информацию о бане
+    ts = time.time()
+    name = None
+    username = None
+    try:
+        chat = await bot.get_chat(target_user_id)
+        name = chat.full_name
+        username = chat.username
+    except Exception:
+        # если не удалось получить данные - просто оставляем None
+        pass
+
+    ban_log[target_user_id] = {
+        "timestamp": ts,
+        "name": name,
+        "username": username,
+    }
+
+    # после бана - показываем кнопку "Разблокировать пользователя"
     await callback.message.edit_reply_markup(
-        reply_markup=make_ban_keyboard(target_user_id)
+        reply_markup=make_unban_keyboard(target_user_id)
     )
-    await callback.message.reply("🔓 Пользователь разблокирован.")
-    await callback.answer("Пользователь удален из черного списка.", show_alert=False)
+    await callback.message.reply("🚫 Пользователь заблокирован.")
+    await callback.answer("Пользователь добавлен в черный список.", show_alert=False)
+
 
 
 @dp.callback_query(F.message.chat.id == ADMIN_CHAT_ID, F.data.startswith("unbancancel:"))
@@ -469,6 +493,44 @@ async def handle_unban_cancel(callback: types.CallbackQuery):
         reply_markup=make_unban_keyboard(target_user_id)
     )
     await callback.answer("Разблокировка отменена.", show_alert=False)
+
+# --- Команда /bans (список заблокированных пользователей с деталями) ---
+
+@dp.message(F.chat.id == ADMIN_CHAT_ID, F.text == "/bans")
+async def cmd_bans(message: types.Message):
+    if not banned_users:
+        await message.reply("🚫 В черном списке пока никого нет.")
+        return
+
+    lines = ["🚫 <b>Заблокированные пользователи</b>:\n"]
+    # сортировка по user_id просто чтобы было стабильно
+    for i, uid in enumerate(sorted(banned_users), start=1):
+        info = ban_log.get(uid)
+        if info:
+            name = info.get("name") or "Имя неизвестно"
+            username = info.get("username")
+            ts = info.get("timestamp")
+            if ts:
+                dt_str = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+            else:
+                dt_str = "дата неизвестна"
+
+            line = f"{i}) {name}"
+            if username:
+                line += f" (@{username})"
+            line += (
+                f"\n    ID: <code>{uid}</code>\n"
+                f"    Заблокирован: {dt_str}\n"
+            )
+        else:
+            line = (
+                f"{i}) ID: <code>{uid}</code>\n"
+                "    (дополнительных данных нет)\n"
+            )
+
+        lines.append(line)
+
+    await message.reply("\n".join(lines))
 
 
 # --- Статистика: выбор периода и расчет ---
