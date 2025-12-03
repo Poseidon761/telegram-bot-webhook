@@ -43,14 +43,16 @@ bot = Bot(
 )
 dp = Dispatcher()
 
+# --- Глобальные структуры ---
+
 # (chat_id, bot_message_id) -> user_id (для ответов из группы)
 message_targets: Dict[Tuple[int, int], int] = {}
 
 # защита от повторной обработки одного и того же апдейта
 processed_updates: Set[int] = set()
 
-# пользователи с включенным анонимным режимом
-anon_users: Set[int] = set()
+# настройки пользователей: user_id -> {"lang": "ru"/"en", "anon": bool, "status_msg_id": int|None}
+user_settings: Dict[int, Dict[str, Any]] = {}
 
 # заблокированные пользователи
 banned_users: Set[int] = set()
@@ -59,12 +61,35 @@ banned_users: Set[int] = set()
 ban_log: Dict[int, Dict[str, Any]] = {}
 
 # лог всех пользовательских сообщений для статистики
-# каждый элемент: {"user_id": int, "timestamp": float, "type": "text"|"photo", "is_anon": bool}
+# каждый элемент: {"user_id": int, "timestamp": float, "type": "text"|"photo"|"video", "is_anon": bool}
 user_message_log: List[Dict[str, Any]] = []
 
 # анти-дубляж: последний отправленный в группу месседж для каждого пользователя
-# user_id -> {"chat_id": int, "message_id": int, "text": str, "time": float, "has_photo": bool, "is_anon": bool}
+# user_id -> {"chat_id": int, "message_id": int, "text": str, "time": float, "has_media": bool, "is_anon": bool}
 last_admin_message: Dict[int, Dict[str, Any]] = {}
+
+# обработанные media_group_id, чтобы не слать "спасибо" по 10 раз на альбом
+handled_media_groups: Set[str] = set()
+
+
+# --- Вспомогательные функции ---
+
+def get_user_settings(user_id: int) -> Dict[str, Any]:
+    if user_id not in user_settings:
+        user_settings[user_id] = {
+            "lang": "ru",
+            "anon": False,
+            "status_msg_id": None,
+        }
+    return user_settings[user_id]
+
+
+def get_lang(user_id: int) -> str:
+    return get_user_settings(user_id).get("lang", "ru")
+
+
+def is_anon(user_id: int) -> bool:
+    return bool(get_user_settings(user_id).get("anon", False))
 
 
 def format_user_info(user: types.User) -> str:
@@ -101,118 +126,361 @@ def make_unban_keyboard(user_id: int) -> InlineKeyboardMarkup:
     )
 
 
-# --- Команда /start в личке ---
+def build_status_text(lang: str, anon: bool) -> str:
+    if lang == "en":
+        lang_line = "Language: English"
+        anon_line = "Anonymous mode: enabled" if anon else "Anonymous mode: disabled"
+        return f"⚙️ Bot status\n\n{lang_line}\n{anon_line}"
+    else:
+        lang_line = "Язык: Русский"
+        anon_line = "Анонимный режим: включен" if anon else "Анонимный режим: выключен"
+        return f"⚙️ Статус бота\n\n{lang_line}\n{anon_line}"
+
+
+async def ensure_status_message(user_id: int) -> None:
+    settings = get_user_settings(user_id)
+    lang = settings["lang"]
+    anon = settings["anon"]
+    status_msg_id = settings.get("status_msg_id")
+
+    if status_msg_id:
+        # просто обновим текст
+        try:
+            await bot.edit_message_text(
+                chat_id=user_id,
+                message_id=status_msg_id,
+                text=build_status_text(lang, anon),
+            )
+            return
+        except Exception:
+            # если по какой-то причине не получилось – попробуем создать новый
+            pass
+
+    msg = await bot.send_message(
+        chat_id=user_id,
+        text=build_status_text(lang, anon),
+    )
+    try:
+        await bot.pin_chat_message(chat_id=user_id, message_id=msg.message_id)
+    except Exception:
+        # если не дали закрепить – хотя бы сохраним ID
+        pass
+    settings["status_msg_id"] = msg.message_id
+
+
+def build_start_text(lang: str) -> str:
+    if lang == "en":
+        return (
+            "Hi! 👋\n\n"
+            "This is a bot for sending messages to Abbas Gallyamov.\n\n"
+            "Here you can:\n"
+            "• ask a question\n"
+            "• share your opinion\n"
+            "• send an idea or suggestion\n\n"
+            "You can send a message as text, a photo or a video. "
+            "Admins will read it and, if necessary, reply to you.\n\n"
+            "You can enable anonymous mode so that admins do not see your name. "
+            "Use the button below, or the /anon command.\n"
+            "After changing anonymity or language, simply send your message."
+        )
+    else:
+        return (
+            "Привет! 👋\n\n"
+            "Это бот для отправки сообщений Аббасу Галлямову.\n\n"
+            "Здесь вы можете:\n"
+            "• задать вопрос\n"
+            "• поделиться мнением\n"
+            "• отправить идею или предложение\n\n"
+            "Вы можете отправлять текст, фотографии и видео. "
+            "Админы все прочитают и при необходимости ответят вам.\n\n"
+            "Вы можете включить анонимный режим, чтобы админы не видели ваши данные. "
+            "Используйте кнопку ниже или команду /anon.\n"
+            "После изменения анонимности или языка просто отправьте сообщение."
+        )
+
+
+def build_thanks_text(lang: str) -> str:
+    if lang == "en":
+        return "Thank you, your message has been sent ✅"
+    else:
+        return "Спасибо, ваше сообщение отправлено ✅"
+
+
+def build_blocked_text(lang: str) -> str:
+    if lang == "en":
+        return "You have been blocked and can no longer use this bot."
+    else:
+        return "Вы были заблокированы и больше не можете пользоваться этим ботом."
+
+
+def build_unsupported_text(lang: str) -> str:
+    if lang == "en":
+        return "Right now I only support text messages, photos and videos."
+    else:
+        return "Пока я принимаю только текстовые сообщения, фотографии и видео."
+
+
+def build_anon_on_text(lang: str) -> str:
+    if lang == "en":
+        return "Anonymous mode is now ON. Your next messages will be sent anonymously."
+    else:
+        return "Анонимный режим включен. Ваши следующие сообщения будут приходить админам как анонимные."
+
+
+def build_anon_off_text(lang: str) -> str:
+    if lang == "en":
+        return "Anonymous mode is now OFF. Your future messages will be sent with your name."
+    else:
+        return "Анонимный режим отключен. Ваши будущие сообщения будут приходить админам с вашими данными."
+
+
+def build_answer_header(lang: str) -> str:
+    if lang == "en":
+        return "Abbas Gallyamov replied to your message:"
+    else:
+        return "Аббас Галлямов ответил на ваше сообщение:"
+
+
+def build_stats_period_label(period: str, lang: str) -> str:
+    # статистика только для админов, оставлю на русском, чтобы не усложнять
+    if period == "day":
+        return "за последние 24 часа"
+    elif period == "week":
+        return "за последнюю неделю"
+    elif period == "month":
+        return "за последний месяц"
+    else:
+        return "за все время"
+
+
+# --- Клавиатура под /start ---
+
+def make_start_keyboard(lang: str, anon: bool) -> InlineKeyboardMarkup:
+    if lang == "en":
+        anon_text = "Disable anonymous mode" if anon else "Enable anonymous mode"
+        ru_btn = "Русский"
+        en_btn = "English"
+    else:
+        anon_text = "Выключить анонимный режим" if anon else "Включить анонимный режим"
+        ru_btn = "Русский"
+        en_btn = "English"
+
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=anon_text,
+                    callback_data="toggle_anon",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=ru_btn,
+                    callback_data="lang:ru",
+                ),
+                InlineKeyboardButton(
+                    text=en_btn,
+                    callback_data="lang:en",
+                ),
+            ],
+        ]
+    )
+
+
+# --- /start в личке ---
 
 
 @dp.message(F.chat.type == "private", F.text == "/start")
 async def cmd_start(message: types.Message):
-    text = (
-        "Привет! 👋\n\n"
-        "Это бот для отправки сообщений Аббасу Галлямову.\n\n"
-        "Здесь вы можете:\n"
-        "• задать вопрос\n"
-        "• поделиться мнением\n"
-        "• отправить идею или предложение\n\n"
-        "Просто напишите сообщение одним или несколькими абзацами, "
-        "или отправьте фото с подписью - админы все прочитают и при необходимости ответят вам.\n\n"
-        "Если хотите скрыть свои данные от админов, отправьте команду /anon - тогда ваши сообщения "
-        "будут приходить как анонимные. При этом бот все равно сможет вам отвечать."
+    user_id = message.from_user.id
+    settings = get_user_settings(user_id)
+    lang = settings["lang"]
+    anon = settings["anon"]
+
+    await message.answer(
+        build_start_text(lang),
+        reply_markup=make_start_keyboard(lang, anon),
     )
-    await message.answer(text)
+
+    await ensure_status_message(user_id)
 
 
-# --- Команда /anon (анонимный режим) ---
+# --- Callback: смена языка и анонимности (кнопки под стартовым) ---
+
+
+@dp.callback_query(F.message.chat.type == "private", F.data == "toggle_anon")
+async def cb_toggle_anon(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    settings = get_user_settings(user_id)
+    settings["anon"] = not settings.get("anon", False)
+    lang = settings["lang"]
+
+    # обновляем закрепленный статус
+    await ensure_status_message(user_id)
+
+    # обновляем клавиатуру под стартовым сообщением (если оно еще существует)
+    try:
+        await callback.message.edit_reply_markup(
+            reply_markup=make_start_keyboard(lang, settings["anon"])
+        )
+    except Exception:
+        pass
+
+    # без лишнего текста в чате - только маленькое уведомление
+    await callback.answer(
+        build_anon_on_text(lang) if settings["anon"] else build_anon_off_text(lang),
+        show_alert=False,
+    )
+
+
+@dp.callback_query(F.message.chat.type == "private", F.data.startswith("lang:"))
+async def cb_set_lang(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    settings = get_user_settings(user_id)
+    _, lang_code = callback.data.split(":", 1)
+
+    if lang_code not in ("ru", "en"):
+        await callback.answer("Unknown language", show_alert=True)
+        return
+
+    settings["lang"] = lang_code
+    lang = settings["lang"]
+
+    # обновляем закрепленный статус
+    await ensure_status_message(user_id)
+
+    # обновляем клавиатуру под стартовым
+    try:
+        await callback.message.edit_reply_markup(
+            reply_markup=make_start_keyboard(lang, settings["anon"])
+        )
+    except Exception:
+        pass
+
+    # небольшое уведомление
+    if lang == "en":
+        await callback.answer("Language switched to English", show_alert=False)
+    else:
+        await callback.answer("Язык переключен на русский", show_alert=False)
+
+
+# --- /anon в личке ---
 
 
 @dp.message(F.chat.type == "private", F.text.regexp(r"^/anon"))
 async def cmd_anon(message: types.Message):
     user_id = message.from_user.id
+    settings = get_user_settings(user_id)
+    lang = settings["lang"]
+
     parts = message.text.split(maxsplit=1)
 
-    # переключатель: если /anon без аргументов - просто переключаем режим
     if len(parts) == 1:
-        if user_id in anon_users:
-            anon_users.remove(user_id)
-            await message.answer(
-                "Анонимный режим отключен. Ваши будущие сообщения будут приходить админам с вашим именем."
-            )
+        # просто переключатель
+        settings["anon"] = not settings["anon"]
+        await ensure_status_message(user_id)
+        if settings["anon"]:
+            await message.answer(build_anon_on_text(lang))
         else:
-            anon_users.add(user_id)
-            await message.answer(
-                "Анонимный режим включен. Ваши будущие сообщения будут приходить админам как анонимные."
-            )
+            await message.answer(build_anon_off_text(lang))
         return
 
     arg = parts[1].strip().lower()
     if arg in ("on", "вкл", "on.", "включить"):
-        anon_users.add(user_id)
-        await message.answer(
-            "Анонимный режим включен. Ваши будущие сообщения будут приходить админам как анонимные."
-        )
+        settings["anon"] = True
+        await ensure_status_message(user_id)
+        await message.answer(build_anon_on_text(lang))
     elif arg in ("off", "выкл", "выключить"):
-        anon_users.discard(user_id)
-        await message.answer(
-            "Анонимный режим отключен. Ваши будущие сообщения будут приходить админам с вашим именем."
-        )
+        settings["anon"] = False
+        await ensure_status_message(user_id)
+        await message.answer(build_anon_off_text(lang))
     else:
-        await message.answer(
-            "Использование команды:\n"
-            "/anon - переключить режим\n"
-            "/anon on - включить анонимный режим\n"
-            "/anon off - выключить анонимный режим"
-        )
+        if lang == "en":
+            await message.answer(
+                "Usage:\n"
+                "/anon - toggle anonymous mode\n"
+                "/anon on - enable anonymous mode\n"
+                "/anon off - disable anonymous mode"
+            )
+        else:
+            await message.answer(
+                "Использование команды:\n"
+                "/anon - переключить режим\n"
+                "/anon on - включить анонимный режим\n"
+                "/anon off - выключить анонимный режим"
+            )
 
 
-# --- Сообщения пользователей боту в личке (текст/фото) ---
+# --- Сообщения пользователей боту в личке ---
 
 
 @dp.message(F.chat.type == "private")
 async def handle_user_message(message: types.Message):
     user = message.from_user
     user_id = user.id
+    settings = get_user_settings(user_id)
+    lang = settings["lang"]
+    anon = settings["anon"]
 
-    # игнорируем все команды (кроме /start и /anon - они обработаны выше)
+    # игнорируем команды (кроме /start и /anon - они уже обработаны выше)
     if message.text and message.text.startswith("/"):
         return
 
     # проверка на бан
     if user_id in banned_users:
-        await message.answer(
-            "Вы были заблокированы и больше не можете пользоваться этим ботом."
-        )
+        await message.answer(build_blocked_text(lang))
         return
 
-    is_anon = user_id in anon_users
-
-    # логируем сообщение для статистики
-    msg_type: str
+    # Определяем тип сообщения
+    kind = None
     if message.text:
-        msg_type = "text"
+        kind = "text"
     elif message.photo:
-        msg_type = "photo"
+        kind = "photo"
+    elif message.video:
+        kind = "video"
     else:
-        msg_type = "other"
+        kind = "unsupported"
 
-    if msg_type in ("text", "photo"):
+    media_group_id = message.media_group_id
+    is_album_first = False
+    if media_group_id:
+        # альбом (несколько фото/видео)
+        if media_group_id in handled_media_groups:
+            is_album_first = False
+        else:
+            is_album_first = True
+            handled_media_groups.add(media_group_id)
+
+    # Если тип не поддерживается - просто говорим об этом, без "спасибо"
+    if kind == "unsupported":
+        await message.answer(build_unsupported_text(lang))
+        return
+
+    # Логируем сообщение для статистики (только один раз на альбом)
+    if (not media_group_id) or is_album_first:
         user_message_log.append(
             {
                 "user_id": user_id,
                 "timestamp": time.time(),
-                "type": msg_type,
-                "is_anon": is_anon,
+                "type": kind,
+                "is_anon": anon,
             }
         )
 
-    # подтверждение пользователю
-    await message.answer("Спасибо, ваше сообщение отправлено админам ✅")
+    # отправляем "спасибо" только если сообщение реально будет отправлено
+    # (и только один раз на альбом)
+    if (not media_group_id) or is_album_first:
+        await message.answer(build_thanks_text(lang))
 
-    # формируем текст для админов
+    # --- Отправка в админ-группу ---
+
     sent_msg: types.Message | None = None
 
-    # вариант: только текст
-    if message.text:
+    # Текст (с анти-дубляжом)
+    if kind == "text":
         base_text: str
-        if is_anon:
+        if anon:
             base_text = (
                 "📩 <b>Новое анонимное сообщение</b>\n\n"
                 f"💬 <b>Текст:</b>\n{message.text}"
@@ -228,8 +496,8 @@ async def handle_user_message(message: types.Message):
         now = time.time()
         info = last_admin_message.get(user_id)
 
-        # если последнее сообщение этого пользователя было меньше 60 секунд назад и тоже текстовое - редактируем его
-        if info and now - info["time"] <= 60 and not info.get("has_photo", False):
+        # если последнее сообщение было недавно и тоже текстовое - редактируем его
+        if info and now - info["time"] <= 60 and not info.get("has_media", False):
             new_text = info["text"] + "\n\n➕ <b>Дополнение:</b>\n" + message.text
             await bot.edit_message_text(
                 chat_id=info["chat_id"],
@@ -241,7 +509,6 @@ async def handle_user_message(message: types.Message):
             last_admin_message[user_id] = info
             sent_msg = None
         else:
-            # отправляем новое сообщение в админ-группу
             sent_msg = await bot.send_message(
                 chat_id=ADMIN_CHAT_ID,
                 text=base_text,
@@ -252,14 +519,14 @@ async def handle_user_message(message: types.Message):
                 "message_id": sent_msg.message_id,
                 "text": base_text,
                 "time": now,
-                "has_photo": False,
-                "is_anon": is_anon,
+                "has_media": False,
+                "is_anon": anon,
             }
 
-    # вариант: фото
-    elif message.photo:
+    # Фото
+    elif kind == "photo":
         caption = message.caption or ""
-        if is_anon:
+        if anon:
             admin_caption = (
                 "📩 <b>Новое анонимное сообщение с фото</b>\n\n"
                 f"💬 <b>Подпись:</b>\n{caption}"
@@ -271,6 +538,15 @@ async def handle_user_message(message: types.Message):
                 f"{user_block}\n\n"
                 f"💬 <b>Подпись:</b>\n{caption}"
             )
+
+        # если это продолжение альбома - просто досылаем фото без кнопок и заголовка
+        if media_group_id and not is_album_first:
+            await bot.send_photo(
+                chat_id=ADMIN_CHAT_ID,
+                photo=message.photo[-1].file_id,
+                caption=caption or None,
+            )
+            return
 
         sent_msg = await bot.send_photo(
             chat_id=ADMIN_CHAT_ID,
@@ -284,15 +560,53 @@ async def handle_user_message(message: types.Message):
             "message_id": sent_msg.message_id,
             "text": admin_caption,
             "time": time.time(),
-            "has_photo": True,
-            "is_anon": is_anon,
+            "has_media": True,
+            "is_anon": anon,
+        }
+
+    # Видео
+    elif kind == "video":
+        caption = message.caption or ""
+        if anon:
+            admin_caption = (
+                "📩 <b>Новое анонимное сообщение с видео</b>\n\n"
+                f"💬 <b>Подпись:</b>\n{caption}"
+            )
+        else:
+            user_block = format_user_info(user)
+            admin_caption = (
+                "📩 <b>Новое сообщение с видео от пользователя</b>\n\n"
+                f"{user_block}\n\n"
+                f"💬 <b>Подпись:</b>\n{caption}"
+            )
+
+        if media_group_id and not is_album_first:
+            await bot.send_video(
+                chat_id=ADMIN_CHAT_ID,
+                video=message.video.file_id,
+                caption=caption or None,
+            )
+            return
+
+        sent_msg = await bot.send_video(
+            chat_id=ADMIN_CHAT_ID,
+            video=message.video.file_id,
+            caption=admin_caption,
+            reply_markup=make_ban_keyboard(user_id),
+        )
+
+        last_admin_message[user_id] = {
+            "chat_id": ADMIN_CHAT_ID,
+            "message_id": sent_msg.message_id,
+            "text": admin_caption,
+            "time": time.time(),
+            "has_media": True,
+            "is_anon": anon,
         }
 
     else:
-        await bot.send_message(
-            chat_id=user_id,
-            text="Пока я принимаю только текстовые сообщения и фотографии.",
-        )
+        # сюда уже не должны попасть, но на всякий
+        await message.answer(build_unsupported_text(lang))
         return
 
     if sent_msg:
@@ -310,9 +624,11 @@ async def handle_admin_reply(message: types.Message):
     if not user_id:
         return
 
+    settings = get_user_settings(user_id)
+    lang = settings["lang"]
+
     # фиксированное имя отправителя для пользователя
-    admin_name = "Аббас Галлямов"
-    header = f"{admin_name} ответил на ваше сообщение:"
+    header = build_answer_header(lang)
 
     if user_id in banned_users:
         await message.reply("Пользователь уже заблокирован, ответ не отправлен.")
@@ -330,12 +646,20 @@ async def handle_admin_reply(message: types.Message):
             photo=message.photo[-1].file_id,
             caption=f"{header}\n\n{caption}",
         )
+    elif message.video:
+        caption = message.caption or ""
+        await bot.send_video(
+            chat_id=user_id,
+            video=message.video.file_id,
+            caption=f"{header}\n\n{caption}",
+        )
     else:
         await bot.send_message(
             chat_id=user_id,
             text=f"{header}\n\n(отправлен ответ, который я пока не умею переслать в исходном виде)",
         )
 
+    # чтобы не засорять чат – оставляем только галочку
     await message.reply("✅ Ответ отправлен пользователю.")
 
 
@@ -372,8 +696,8 @@ async def handle_ban_button(callback: types.CallbackQuery):
     await callback.answer("Вы уверены, что хотите заблокировать пользователя?", show_alert=False)
 
 
-@dp.callback_query(F.message.chat.id == ADMIN_CHAT_ID, F.data.startswith("unbanconfirm:"))
-async def handle_unban_confirm(callback: types.CallbackQuery):
+@dp.callback_query(F.message.chat.id == ADMIN_CHAT_ID, F.data.startswith("banconfirm:"))
+async def handle_ban_confirm(callback: types.CallbackQuery):
     data = callback.data or ""
     try:
         _, user_id_str = data.split(":", 1)
@@ -382,16 +706,30 @@ async def handle_unban_confirm(callback: types.CallbackQuery):
         await callback.answer("Ошибка: не могу прочитать ID пользователя.", show_alert=True)
         return
 
-    banned_users.discard(target_user_id)
-    ban_log.pop(target_user_id, None)
+    banned_users.add(target_user_id)
 
-    # возвращаем кнопку "Заблокировать пользователя"
+    # сохраняем информацию о бане
+    ts = time.time()
+    name = None
+    username = None
+    try:
+        chat = await bot.get_chat(target_user_id)
+        name = chat.full_name
+        username = chat.username
+    except Exception:
+        pass
+
+    ban_log[target_user_id] = {
+        "timestamp": ts,
+        "name": name,
+        "username": username,
+    }
+
+    # после бана - показываем кнопку "Разблокировать пользователя"
     await callback.message.edit_reply_markup(
-        reply_markup=make_ban_keyboard(target_user_id)
+        reply_markup=make_unban_keyboard(target_user_id)
     )
-    await callback.message.reply("🔓 Пользователь разблокирован.")
-    await callback.answer("Пользователь удален из черного списка.", show_alert=False)
-
+    await callback.answer("Пользователь добавлен в черный список.", show_alert=False)
 
 
 @dp.callback_query(F.message.chat.id == ADMIN_CHAT_ID, F.data.startswith("bancancel:"))
@@ -440,8 +778,8 @@ async def handle_unban_button(callback: types.CallbackQuery):
     await callback.answer("Подтвердить разблокировку пользователя?", show_alert=False)
 
 
-@dp.callback_query(F.message.chat.id == ADMIN_CHAT_ID, F.data.startswith("banconfirm:"))
-async def handle_ban_confirm(callback: types.CallbackQuery):
+@dp.callback_query(F.message.chat.id == ADMIN_CHAT_ID, F.data.startswith("unbanconfirm:"))
+async def handle_unban_confirm(callback: types.CallbackQuery):
     data = callback.data or ""
     try:
         _, user_id_str = data.split(":", 1)
@@ -450,33 +788,13 @@ async def handle_ban_confirm(callback: types.CallbackQuery):
         await callback.answer("Ошибка: не могу прочитать ID пользователя.", show_alert=True)
         return
 
-    banned_users.add(target_user_id)
+    banned_users.discard(target_user_id)
+    ban_log.pop(target_user_id, None)
 
-    # сохраняем информацию о бане
-    ts = time.time()
-    name = None
-    username = None
-    try:
-        chat = await bot.get_chat(target_user_id)
-        name = chat.full_name
-        username = chat.username
-    except Exception:
-        # если не удалось получить данные - просто оставляем None
-        pass
-
-    ban_log[target_user_id] = {
-        "timestamp": ts,
-        "name": name,
-        "username": username,
-    }
-
-    # после бана - показываем кнопку "Разблокировать пользователя"
     await callback.message.edit_reply_markup(
-        reply_markup=make_unban_keyboard(target_user_id)
+        reply_markup=make_ban_keyboard(target_user_id)
     )
-    await callback.message.reply("🚫 Пользователь заблокирован.")
-    await callback.answer("Пользователь добавлен в черный список.", show_alert=False)
-
+    await callback.answer("Пользователь удален из черного списка.", show_alert=False)
 
 
 @dp.callback_query(F.message.chat.id == ADMIN_CHAT_ID, F.data.startswith("unbancancel:"))
@@ -494,7 +812,9 @@ async def handle_unban_cancel(callback: types.CallbackQuery):
     )
     await callback.answer("Разблокировка отменена.", show_alert=False)
 
-# --- Команда /bans (список заблокированных пользователей с деталями) ---
+
+# --- /bans: список банов ---
+
 
 @dp.message(F.chat.id == ADMIN_CHAT_ID, F.text == "/bans")
 async def cmd_bans(message: types.Message):
@@ -502,8 +822,6 @@ async def cmd_bans(message: types.Message):
         await message.reply("🚫 В черном списке пока никого нет.")
         return
 
-    lines = ["🚫 <b>Заблокированные пользователи</b>:\n"]
-    # сортировка по user_id просто чтобы было стабильно
     for i, uid in enumerate(sorted(banned_users), start=1):
         info = ban_log.get(uid)
         if info:
@@ -515,22 +833,20 @@ async def cmd_bans(message: types.Message):
             else:
                 dt_str = "дата неизвестна"
 
-            line = f"{i}) {name}"
+            text = f"{i}) {name}"
             if username:
-                line += f" (@{username})"
-            line += (
-                f"\n    ID: <code>{uid}</code>\n"
-                f"    Заблокирован: {dt_str}\n"
+                text += f" (@{username})"
+            text += (
+                f"\nID: <code>{uid}</code>\n"
+                f"Заблокирован: {dt_str}"
             )
         else:
-            line = (
+            text = (
                 f"{i}) ID: <code>{uid}</code>\n"
-                "    (дополнительных данных нет)\n"
+                "Дополнительных данных нет."
             )
 
-        lines.append(line)
-
-    await message.reply("\n".join(lines))
+        await message.reply(text, reply_markup=make_unban_keyboard(uid))
 
 
 # --- Статистика: выбор периода и расчет ---
@@ -570,16 +886,14 @@ def build_stats_text(period: str) -> str:
 
     if period == "day":
         cutoff = now - 24 * 60 * 60
-        label = "за последние 24 часа"
     elif period == "week":
         cutoff = now - 7 * 24 * 60 * 60
-        label = "за последнюю неделю"
     elif period == "month":
         cutoff = now - 30 * 24 * 60 * 60
-        label = "за последний месяц"
     else:
         cutoff = 0
-        label = "за все время"
+
+    label = build_stats_period_label(period, "ru")
 
     filtered = [e for e in user_message_log if e["timestamp"] >= cutoff]
 
@@ -590,6 +904,7 @@ def build_stats_text(period: str) -> str:
     users = {e["user_id"] for e in filtered}
     text_count = sum(1 for e in filtered if e["type"] == "text")
     photo_count = sum(1 for e in filtered if e["type"] == "photo")
+    video_count = sum(1 for e in filtered if e["type"] == "video")
     anon_users_in_period = {e["user_id"] for e in filtered if e["is_anon"]}
 
     text = (
@@ -598,6 +913,7 @@ def build_stats_text(period: str) -> str:
         f"Уникальных пользователей: <b>{len(users)}</b>\n"
         f"Текстовых сообщений: <b>{text_count}</b>\n"
         f"Сообщений с фото: <b>{photo_count}</b>\n"
+        f"Сообщений с видео: <b>{video_count}</b>\n"
         f"Пользователей, писавших анонимно в этот период: <b>{len(anon_users_in_period)}</b>\n"
         f"Заблокированных пользователей сейчас: <b>{len(banned_users)}</b>"
     )
