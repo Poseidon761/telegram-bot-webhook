@@ -71,6 +71,10 @@ last_admin_message: Dict[int, Dict[str, Any]] = {}
 # обработанные media_group_id, чтобы не слать "спасибо" по 10 раз на альбом
 handled_media_groups: Set[str] = set()
 
+# теги пользователей: избранный / под наблюдением
+# user_id -> {"fav": bool, "watch": bool}
+user_tags: Dict[int, Dict[str, bool]] = {}
+
 
 # --- Вспомогательные функции ---
 
@@ -92,6 +96,12 @@ def is_anon(user_id: int) -> bool:
     return bool(get_user_settings(user_id).get("anon", False))
 
 
+def get_user_tags(user_id: int) -> Dict[str, bool]:
+    if user_id not in user_tags:
+        user_tags[user_id] = {"fav": False, "watch": False}
+    return user_tags[user_id]
+
+
 def format_user_info(user: types.User) -> str:
     text = f"👤 <b>{user.full_name}</b>"
     if user.username:
@@ -101,27 +111,61 @@ def format_user_info(user: types.User) -> str:
 
 
 def make_ban_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    tags = get_user_tags(user_id)
+    fav = tags["fav"]
+    watch = tags["watch"]
+
+    fav_text = "⭐ Избранное" if not fav else "⭐ Убрать"
+    watch_text = "👁 Наблюдение" if not watch else "👁 Убрать"
+
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🚫 Заблокировать пользователя",
+                    text="🚫 Заблокировать",
                     callback_data=f"ban:{user_id}",
                 )
-            ]
+            ],
+            [
+                InlineKeyboardButton(
+                    text=fav_text,
+                    callback_data=f"tag:fav:{user_id}",
+                ),
+                InlineKeyboardButton(
+                    text=watch_text,
+                    callback_data=f"tag:watch:{user_id}",
+                ),
+            ],
         ]
     )
 
 
 def make_unban_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    tags = get_user_tags(user_id)
+    fav = tags["fav"]
+    watch = tags["watch"]
+
+    fav_text = "⭐ Избранное" if not fav else "⭐ Убрать"
+    watch_text = "👁 Наблюдение" if not watch else "👁 Убрать"
+
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🔓 Разблокировать пользователя",
+                    text="🔓 Разблокировать",
                     callback_data=f"unban:{user_id}",
                 )
-            ]
+            ],
+            [
+                InlineKeyboardButton(
+                    text=fav_text,
+                    callback_data=f"tag:fav:{user_id}",
+                ),
+                InlineKeyboardButton(
+                    text=watch_text,
+                    callback_data=f"tag:watch:{user_id}",
+                ),
+            ],
         ]
     )
 
@@ -282,6 +326,29 @@ def make_start_keyboard(lang: str, anon: bool) -> InlineKeyboardMarkup:
     )
 
 
+def make_admin_panel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📥 Новые сообщения",
+                    callback_data="panel:new",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="📊 Статистика",
+                    callback_data="panel:stats",
+                ),
+                InlineKeyboardButton(
+                    text="🚫 Черный список",
+                    callback_data="panel:bans",
+                ),
+            ],
+        ]
+    )
+
+
 # --- /start в личке ---
 
 
@@ -406,6 +473,33 @@ async def cmd_anon(message: types.Message):
             )
 
 
+# --- Панель админа ---
+
+
+@dp.message(F.chat.id == ADMIN_CHAT_ID, F.text == "/panel")
+async def cmd_panel(message: types.Message):
+    await message.reply(
+        "Панель управления:",
+        reply_markup=make_admin_panel_keyboard(),
+    )
+
+
+@dp.callback_query(F.message.chat.id == ADMIN_CHAT_ID, F.data.startswith("panel:"))
+async def handle_panel_callback(callback: types.CallbackQuery):
+    _, action = callback.data.split(":", 1)
+
+    if action == "stats":
+        await cmd_stats(callback.message)
+        await callback.answer()
+    elif action == "bans":
+        await cmd_bans(callback.message)
+        await callback.answer()
+    elif action == "new":
+        await callback.answer("Функция очереди пока не реализована.", show_alert=True)
+    else:
+        await callback.answer("Неизвестная команда панели.", show_alert=True)
+
+
 # --- Сообщения пользователей боту в личке ---
 
 
@@ -421,13 +515,36 @@ async def handle_user_message(message: types.Message):
     if message.text and message.text.startswith("/"):
         return
 
-    # игнорируем закрепленные сообщения и прочий сервис, который не является реальным вводом
+    # игнорируем закрепленные сообщения и прочий сервис
     if message.content_type == "pinned_message":
         return
 
     # проверка на бан
     if user_id in banned_users:
         await message.answer(build_blocked_text(lang))
+        return
+
+    # антиспам - если пользователь слишком часто пишет
+    now = time.time()
+    window_start = now - 60  # секунды
+
+    recent = [
+        e for e in user_message_log
+        if e["user_id"] == user_id and e["timestamp"] >= window_start
+    ]
+
+    if len(recent) >= 5:
+        if lang == "en":
+            warn = (
+                "You are sending messages too often.\n"
+                "Please try to combine your thoughts into fewer messages."
+            )
+        else:
+            warn = (
+                "Вы отправляете сообщения слишком часто.\n"
+                "Попробуйте объединить вашу мысль в меньшее количество сообщений."
+            )
+        await message.answer(warn)
         return
 
     # Определяем тип сообщения
@@ -472,29 +589,17 @@ async def handle_user_message(message: types.Message):
 
     sent_msg: types.Message | None = None
 
-    # --- Текст (с анти-дубляжом, включая медиа, если последнее было медиа) ---
+    # --- Текст (с анти-дубляжом, включая дополнения к медиа) ---
     if kind == "text":
-        base_text: str
         now = time.time()
         info = last_admin_message.get(user_id)
-
-        if anon:
-            text_block = message.text
-            # если есть последнее сообщение и оно свежее - дополняем его
-        else:
-            text_block = message.text
-
-
-
-
-
 
         if info and now - info["time"] <= 60:
             # есть последнее сообщение (может быть текст или медиа), добавим "Дополнение"
             old_text = info["text"]
             new_block = old_text + "\n\n➕ <b>Дополнение:</b>\n" + message.text
 
-            # выбираем, какая клавиатура должна быть сейчас
+            # выбираем клавиатуру в зависимости от бан/не бан
             if user_id in banned_users:
                 kb = make_unban_keyboard(user_id)
             else:
@@ -521,12 +626,6 @@ async def handle_user_message(message: types.Message):
             info["text"] = new_block
             last_admin_message[user_id] = info
             sent_msg = None
-
-
-
-
-
-
         else:
             # создаем новое текстовое сообщение
             if anon:
@@ -841,6 +940,44 @@ async def handle_unban_cancel(callback: types.CallbackQuery):
     await callback.answer("Разблокировка отменена.", show_alert=False)
 
 
+@dp.callback_query(F.message.chat.id == ADMIN_CHAT_ID, F.data.startswith("tag:"))
+async def handle_tag_callback(callback: types.CallbackQuery):
+    data = callback.data or ""
+    try:
+        _, tag_type, user_id_str = data.split(":", 2)
+        target_user_id = int(user_id_str)
+    except Exception:
+        await callback.answer("Ошибка при разборе тега.", show_alert=True)
+        return
+
+    tags = get_user_tags(target_user_id)
+
+    if tag_type == "fav":
+        tags["fav"] = not tags["fav"]
+        msg = "Добавлен в избранное." if tags["fav"] else "Удалён из избранного."
+    elif tag_type == "watch":
+        tags["watch"] = not tags["watch"]
+        msg = "Добавлен под наблюдение." if tags["watch"] else "Метка снята."
+    else:
+        await callback.answer("Неизвестный тип тега.", show_alert=True)
+        return
+
+    user_tags[target_user_id] = tags
+
+    # пересобираем клавиатуру
+    if target_user_id in banned_users:
+        kb = make_unban_keyboard(target_user_id)
+    else:
+        kb = make_ban_keyboard(target_user_id)
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=kb)
+    except Exception:
+        pass
+
+    await callback.answer(msg, show_alert=False)
+
+
 # --- /bans: список банов ---
 
 
@@ -864,13 +1001,10 @@ async def cmd_bans(message: types.Message):
             text = f"{i}) {name}"
             if username:
                 text += f" (@{username})"
-            text += (
-                f"\nID: <code>{uid}</code>\n"
-                f"Заблокирован: {dt_str}"
-            )
+            text += f"\nЗаблокирован: {dt_str}"
         else:
             text = (
-                f"{i}) ID: <code>{uid}</code>\n"
+                f"{i}) Пользователь\n"
                 "Дополнительных данных нет."
             )
 
